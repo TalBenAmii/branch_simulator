@@ -24,76 +24,76 @@ enum ShareType
     USING_SHARE_MID = 2
 };
 
+uint8_t getXoredHistory(uint32_t pc, uint8_t history, int Shared, unsigned fsmSize);
+
 const static int USING_SHARE_LSB_BITS = 2;
 const static int USING_SHARE_MID_BITS = 16;
 const static int DEFAULT_HISTORY = 0;
+
+class BTB_ROW
+{
+  public:
+    uint32_t tag, dest;
+    uint8_t local_history;
+    vector<State> local_FSM;
+    bool valid;
+    BTB_ROW(unsigned fsmSize, State defaultState, uint32_t tag = 0, uint32_t dest = 0,
+            uint8_t history = DEFAULT_HISTORY)
+        : tag(tag), dest(dest), local_history(history), local_FSM(fsmSize, defaultState), valid(false)
+    {
+    }
+};
 
 class BP
 {
   public:
     const static int ALIGNED_BITS = 2;
-    const static int VALID_BITS = 1;
+    const static int VALID_BITS_SIZE = 1;
+    const static int DEST_SIZE = 30;
 
-    unsigned btbSize, historySize, tagSize, fsmState;
+    unsigned btbSize, btbBitSize, historyBitSize, tagSize, tagBitSize, fsmSize;
+    State defaultState;
     bool isGlobalHist, isGlobalTable;
     int Shared;
     SIM_stats stats;
-    vector<BTB_ROW> BTB;
-    vector<State> global_FSM;
-    uint8_t global_history;
+    vector<State> global_FSM; // global predictor (global FSM)
+    uint8_t global_history;   // global history (GHR)
+    vector<BTB_ROW> BTB;      // local predictors (with FSM and BHRs)
+
     friend class BTB_ROW;
 
     BP() = default;
+    ~BP() = default;
 
-    BP(unsigned btbSize, unsigned historySize, unsigned tagSize, unsigned fsmState, bool isGlobalHist,
+    BP(unsigned btbSize, unsigned historyBitSize, unsigned tagBitSize, unsigned fsmState, bool isGlobalHist,
        bool isGlobalTable, int Shared)
-        : btbSize(btbSize), historySize(historySize), tagSize(tagSize), fsmState(fsmState), isGlobalHist(isGlobalHist),
-          isGlobalTable(isGlobalTable), Shared(Shared), stats(), BTB(), global_FSM(), global_history(DEFAULT_HISTORY)
+        : btbSize(btbSize), btbBitSize(static_cast<unsigned>(log2(btbSize))), historyBitSize(historyBitSize),
+          tagSize(static_cast<unsigned>(pow(2, tagBitSize))), tagBitSize(tagBitSize),
+          fsmSize(static_cast<unsigned>(pow(2, historyBitSize))), defaultState(static_cast<State>(fsmState)),
+          isGlobalHist(isGlobalHist), isGlobalTable(isGlobalTable), Shared(Shared), stats(),
+          global_FSM(fsmSize, defaultState), global_history(DEFAULT_HISTORY),
+          BTB(btbSize, BTB_ROW(fsmSize, defaultState))
     {
-        BTB.reserve(btbSize);
-
-        global_FSM.reserve(historySize);
-        for (unsigned i = 0; i < historySize; ++i)
-        {
-            global_FSM[i] = static_cast<State>(this->fsmState);
-        }
         // calc predictor size
-        //   Predictor size: #BHRs × (tag_size + valid + history_size) + 2 × 2 history_size
-        stats.size = btbSize * (tagSize + VALID_BITS + historySize) + 2 * pow(2, historySize);
+        //   Predictor size: #BHRs × (tag_size + valid + history_size) + 2 × 2^history_size
+        stats.br_num = 0;
+        stats.flush_num = 0;
+        stats.size = isGlobalTable ? btbSize * (tagBitSize + DEST_SIZE + VALID_BITS_SIZE) + 2 * fsmSize
+                                   : btbSize * (tagBitSize + DEST_SIZE + VALID_BITS_SIZE + 2 * fsmSize);
+        stats.size += isGlobalHist ? historyBitSize : btbSize * historyBitSize;
     }
 };
 
-BP branchPredictor;
+BP branchPredictor; // bss allocated, ugly but avoids slow heap allocations (not including vectors) and annoying memory
+                    // leaks
+// good enough for one c file restriction
 
-class BTB_ROW
-{
-  public:
-    int tag;
-    uint32_t dest;
-    uint8_t local_history;
-    vector<State> local_FSM;
-    BTB_ROW(int tag = -1, uint32_t dest = 0, uint8_t history = DEFAULT_HISTORY)
-        : tag(tag), dest(dest), local_history(history), local_FSM()
-    {
-        local_FSM.reserve(branchPredictor.historySize);
-        for (unsigned i = 0; i < branchPredictor.historySize; ++i)
-        {
-            local_FSM[i] = static_cast<State>(branchPredictor.fsmState);
-        }
-    }
-};
-
-int BP_init(unsigned btbSize, unsigned historySize, unsigned tagSize, unsigned fsmState, bool isGlobalHist,
+int BP_init(unsigned btbSize, unsigned historyBitSize, unsigned tagSize, unsigned fsmState, bool isGlobalHist,
             bool isGlobalTable, int Shared)
 {
     try
     {
-        branchPredictor = BP(btbSize, historySize, tagSize, fsmState, isGlobalHist, isGlobalTable, Shared);
-        // initialize btb rows
-        for (unsigned i = 0; i < btbSize; ++i)
-        {
-            branchPredictor.BTB[i] = BTB_ROW();
-        }
+        branchPredictor = BP(btbSize, historyBitSize, tagSize, fsmState, isGlobalHist, isGlobalTable, Shared);
     }
     catch (...)
     {
@@ -104,87 +104,96 @@ int BP_init(unsigned btbSize, unsigned historySize, unsigned tagSize, unsigned f
 
 bool BP_predict(uint32_t pc, uint32_t *dst)
 {
-    // condition checking for local FSMs
     BTB_ROW &currRow = branchPredictor.BTB[(pc >> BP::ALIGNED_BITS) % branchPredictor.btbSize];
-    int &currTag = currRow.tag;
-    int pcTag = ((pc >> (BP::ALIGNED_BITS + branchPredictor.btbSize)) % branchPredictor.tagSize);
-    uint8_t &currHistory = branchPredictor.isGlobalHist ? branchPredictor.global_history : currRow.local_history;
-    State &currState =
-        branchPredictor.isGlobalTable ? branchPredictor.global_FSM[currHistory] : currRow.local_FSM[currHistory];
+    uint32_t &currTag = currRow.tag;
+    uint32_t pcTag = ((pc >> (BP::ALIGNED_BITS + branchPredictor.btbBitSize)) % branchPredictor.tagSize);
+    uint8_t *currHistory = branchPredictor.isGlobalHist ? &branchPredictor.global_history : &currRow.local_history;
+    vector<State> &currFsm = branchPredictor.isGlobalTable ? branchPredictor.global_FSM : currRow.local_FSM;
+    State *currState = &currFsm[*currHistory];
+    bool &currValid = currRow.valid;
+    uint8_t indexedHistory;
 
     // update currHistory according to the need of l/g-share
-    if (branchPredictor.isGlobalTable == true && branchPredictor.Shared > 0)
+    if (branchPredictor.isGlobalTable && branchPredictor.Shared != ShareType::NOT_USING_SHARE)
     {
-        // false: L-share, true: G-share
-        bool shareType = branchPredictor.isGlobalHist ? true : false;
-        // calculating history and pc regs for xor operation
-        uint8_t doXorWithHistory = shareType ? branchPredictor.global_history : currHistory;
-        uint8_t doXorWithPc = branchPredictor.Shared == USING_SHARE_LSB
-                                  ? (pc > USING_SHARE_LSB_BITS) % branchPredictor.historySize
-                                  : (pc > USING_SHARE_MID_BITS) % branchPredictor.historySize;
-        currHistory = doXorWithHistory ^ doXorWithPc;
-        // updating correct state
-        currState = branchPredictor.global_FSM[currHistory];
+        indexedHistory = getXoredHistory(pc, *currHistory, branchPredictor.Shared, branchPredictor.fsmSize);
+        currState = &branchPredictor.global_FSM[indexedHistory];
     }
+
     // getting curr state from global/local FSM
     // if row not initialized or initialized but tag isn't matching or matching but not taken: return false
-    if (currTag == -1 || currTag != pcTag || currState == SNT || currState == WNT)
+    if (!currValid || currTag != pcTag || *currState == SNT ||
+        *currState == WNT) // TODO: check if valid bit is needed in cond
     {
         *dst = pc + 4;
         return false;
     }
     // else it's taken
-
     *dst = currRow.dest;
     return true;
 }
 
 void BP_update(uint32_t pc, uint32_t targetPc, bool taken, uint32_t pred_dst)
 {
-
     BTB_ROW &currRow = branchPredictor.BTB[(pc >> BP::ALIGNED_BITS) % branchPredictor.btbSize];
-    int &currTag = currRow.tag;
-    int pcTag = ((pc >> (BP::ALIGNED_BITS + branchPredictor.btbSize)) % branchPredictor.tagSize);
-    uint8_t &currHistory = branchPredictor.isGlobalHist ? branchPredictor.global_history : currRow.local_history;
-    State &currState =
-        branchPredictor.isGlobalTable ? branchPredictor.global_FSM[currHistory] : currRow.local_FSM[currHistory];
-    vector<State> &currFsm =
-        branchPredictor.isGlobalHist ? branchPredictor.global_FSM : branchPredictor.BTB[currHistory].local_FSM;
+    uint32_t &currTag = currRow.tag;
+    uint32_t pcTag = ((pc >> (BP::ALIGNED_BITS + branchPredictor.btbBitSize)) % branchPredictor.tagSize);
+    uint8_t *currHistory = branchPredictor.isGlobalHist ? &branchPredictor.global_history : &currRow.local_history;
+    vector<State> &currFsm = branchPredictor.isGlobalTable ? branchPredictor.global_FSM : currRow.local_FSM;
+    State *currState = &currFsm[*currHistory];
+    bool &currValid = currRow.valid;
+    uint8_t indexedHistory;
+
+    // update currHistory according to the need of l/g-share
+    if (branchPredictor.isGlobalTable && branchPredictor.Shared != ShareType::NOT_USING_SHARE)
+    {
+        indexedHistory = getXoredHistory(pc, *currHistory, branchPredictor.Shared, branchPredictor.fsmSize);
+        currState = &currFsm[indexedHistory];
+    }
 
     // update handled brs and flushs
     ++branchPredictor.stats.br_num;
-    if (targetPc != pred_dst)
+    if ((taken && (targetPc != pred_dst)) || (!taken && (pc + 4 != pred_dst)))
     {
-        ++branchPredictor.stats.flush_num; // TODO: fix flush count
+        ++branchPredictor.stats.flush_num;
+        currRow.dest = targetPc;
     }
-    // check if need to update btb row
-    if (currTag != pcTag)
+    // check if need to initialize row in cases of valid bit is 0 or tags are coliding
+    if (currTag != pcTag || !currValid)
     {
-        currTag = pcTag; // TODO: update dest
-        currFsm = vector<State>();
-        currFsm.reserve(branchPredictor.historySize);
-        for (auto &state : currFsm)
+        currValid = true;
+        currTag = pcTag;
+        currRow.dest = targetPc;
+        if (!branchPredictor.isGlobalHist)
         {
-            state = static_cast<State>(branchPredictor.fsmState);
+            *currHistory = DEFAULT_HISTORY;
+            currState = &currFsm[*currHistory];
         }
-        currHistory = DEFAULT_HISTORY;
-    }
-    else
-    {
-        if (taken && currState + 1 < State::ST)
+        if (!branchPredictor.isGlobalTable)
         {
-            currState = static_cast<State>(static_cast<int>(currState) + 1);
-        }
-        else if (taken && currState - 1 > State::SNT)
-        {
-            currState = static_cast<State>(static_cast<int>(currState) - 1);
+            currFsm.assign(branchPredictor.fsmSize, branchPredictor.defaultState);
+            currState = &currFsm[*currHistory]; // update currState pointer to correct historyValue
         }
     }
-    return;
+    if (taken && *currState + 1 <= State::ST)
+    {
+        *currState = static_cast<State>(static_cast<int>(*currState) + 1);
+    }
+    else if (!taken && *currState - 1 >= State::SNT)
+    {
+        *currState = static_cast<State>(static_cast<int>(*currState) - 1);
+    }
+    *currHistory = static_cast<uint8_t>(((*currHistory << 1) | (taken ? 1 : 0)) % (branchPredictor.fsmSize));
 }
 
 void BP_GetStats(SIM_stats *curStats)
 {
     *curStats = branchPredictor.stats;
-    return;
+}
+
+uint8_t getXoredHistory(uint32_t pc, uint8_t history, int Shared, unsigned fsmSize)
+{
+    uint8_t doXorWithPc = Shared == USING_SHARE_LSB ? static_cast<uint8_t>((pc >> USING_SHARE_LSB_BITS) % fsmSize)
+                                                    : static_cast<uint8_t>((pc >> USING_SHARE_MID_BITS) % fsmSize);
+    return (history ^ doXorWithPc);
 }
